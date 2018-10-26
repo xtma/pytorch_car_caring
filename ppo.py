@@ -169,7 +169,11 @@ class Agent():
     def store(self, transition):
         self.buffer[self.counter] = transition
         self.counter += 1
-        return self.counter % self.buffer_capacity == 0
+        if self.counter == self.buffer_capacity:
+            self.counter = 0
+            return True
+        else:
+            return False
 
     def update(self):
         self.training_step += 1
