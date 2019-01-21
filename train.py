@@ -11,12 +11,13 @@ from torch.distributions import Beta
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 from utils import DrawLine
 
-parser = argparse.ArgumentParser(description='Solve the CarRacing-v0 with PPO')
-parser.add_argument('--gamma', type=float, default=0.95, metavar='G', help='discount factor (default: 0.95)')
-parser.add_argument('--action-repeat', type=int, default=8, metavar='N', help='repeat action in N frames (default: 12)')
+parser = argparse.ArgumentParser(description='Train a PPO agent for the CarRacing-v0')
+parser.add_argument('--gamma', type=float, default=0.99, metavar='G', help='discount factor (default: 0.99)')
+parser.add_argument('--action-repeat', type=int, default=8, metavar='N', help='repeat action in N frames (default: 8)')
 parser.add_argument('--img-stack', type=int, default=4, metavar='N', help='stack N image in a state (default: 4)')
 parser.add_argument('--seed', type=int, default=0, metavar='N', help='random seed (default: 0)')
 parser.add_argument('--render', action='store_true', help='render the environment')
+parser.add_argument('--vis', action='store_true', help='use visdom')
 parser.add_argument(
     '--log-interval', type=int, default=10, metavar='N', help='interval between training status logs (default: 10)')
 args = parser.parse_args()
@@ -27,11 +28,14 @@ torch.manual_seed(args.seed)
 if use_cuda:
     torch.cuda.manual_seed(args.seed)
 
-transition = np.dtype([('s', np.float64, (args.img_stack, 96, 96)), ('a', np.float64, (3,)), ('a_log_p', np.float64),
+transition = np.dtype([('s', np.float64, (args.img_stack, 96, 96)), ('a', np.float64, (3,)), ('a_logp', np.float64),
                        ('r', np.float64), ('s_', np.float64, (args.img_stack, 96, 96))])
 
 
 class Env():
+    """
+    Environment wrapper for CarRacing 
+    """
 
     def __init__(self):
         self.env = gym.make('CarRacing-v0')
@@ -45,7 +49,7 @@ class Env():
         self.die = False
         img_rgb = self.env.reset()
         img_gray = self.rgb2gray(img_rgb)
-        self.stack = [img_gray] * args.img_stack
+        self.stack = [img_gray] * args.img_stack  # four frames for decision
         return np.array(self.stack)
 
     def step(self, action):
@@ -74,6 +78,7 @@ class Env():
 
     @staticmethod
     def rgb2gray(rgb, norm=True):
+        # rgb image -> gray [0, 1]
         gray = np.dot(rgb[..., :], [0.299, 0.587, 0.114])
         if norm:
             # normalize
@@ -82,6 +87,7 @@ class Env():
 
     @staticmethod
     def reward_memory():
+        # record reward for last 100 steps
         count = 0
         length = 100
         history = np.zeros(length)
@@ -96,6 +102,9 @@ class Env():
 
 
 class Net(nn.Module):
+    """
+    Actor-Critic Network for PPO
+    """
 
     def __init__(self):
         super(Net, self).__init__()
@@ -137,9 +146,11 @@ class Net(nn.Module):
 
 
 class Agent():
-
-    clip_param = 0.1
+    """
+    Agent for training
+    """
     max_grad_norm = 0.5
+    clip_param = 0.1  # epsilon in clipped loss
     ppo_epoch = 10
     buffer_capacity, batch_size = 2000, 128
 
@@ -149,7 +160,7 @@ class Agent():
         self.buffer = np.empty(self.buffer_capacity, dtype=transition)
         self.counter = 0
 
-        self.optimizer = optim.Adam(self.net.parameters(), lr=1e-4)
+        self.optimizer = optim.Adam(self.net.parameters(), lr=1e-3)
 
     def select_action(self, state):
         state = torch.from_numpy(state).double().to(device).unsqueeze(0)
@@ -157,11 +168,11 @@ class Agent():
             alpha, beta = self.net(state)[0]
         dist = Beta(alpha, beta)
         action = dist.sample()
-        action_log_prob = dist.log_prob(action).sum(dim=1)
+        a_logp = dist.log_prob(action).sum(dim=1)
 
         action = action.squeeze().cpu().numpy()
-        action_log_prob = action_log_prob.item()
-        return action, action_log_prob
+        a_logp = a_logp.item()
+        return action, a_logp
 
     def save_param(self):
         torch.save(self.net.state_dict(), 'param/ppo_net_params.pkl')
@@ -183,20 +194,20 @@ class Agent():
         r = torch.tensor(self.buffer['r'], dtype=torch.double).to(device).view(-1, 1)
         s_ = torch.tensor(self.buffer['s_'], dtype=torch.double).to(device)
 
-        old_action_log_probs = torch.tensor(self.buffer['a_log_p'], dtype=torch.double).to(device).view(-1, 1)
+        old_a_logp = torch.tensor(self.buffer['a_logp'], dtype=torch.double).to(device).view(-1, 1)
 
-        r = (r - r.mean()) / (r.std() + 1e-5)
         with torch.no_grad():
             target_v = r + args.gamma * self.net(s_)[1]
             adv = target_v - self.net(s)[1]
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)
 
         for _ in range(self.ppo_epoch):
             for index in BatchSampler(SubsetRandomSampler(range(self.buffer_capacity)), self.batch_size, False):
 
                 alpha, beta = self.net(s[index])[0]
                 dist = Beta(alpha, beta)
-                action_log_probs = dist.log_prob(a[index]).sum(dim=1, keepdim=True)
-                ratio = torch.exp(action_log_probs - old_action_log_probs[index])
+                a_logp = dist.log_prob(a[index]).sum(dim=1, keepdim=True)
+                ratio = torch.exp(a_logp - old_a_logp[index])
 
                 surr1 = ratio * adv[index]
                 surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * adv[index]
@@ -210,35 +221,38 @@ class Agent():
                 self.optimizer.step()
 
 
-agent = Agent()
-env = Env()
-draw_reward = DrawLine(env="car", title="PPO", xlabel="Episode", ylabel="Moving averaged episode reward")
+if __name__ == "__main__":
+    agent = Agent()
+    env = Env()
+    if args.vis:
+        draw_reward = DrawLine(env="car", title="PPO", xlabel="Episode", ylabel="Moving averaged episode reward")
 
-training_records = []
-running_score = 0
-state = env.reset()
-for i_ep in range(100000):
-    score = 0
+    training_records = []
+    running_score = 0
     state = env.reset()
+    for i_ep in range(100000):
+        score = 0
+        state = env.reset()
 
-    for t in range(1000):
-        action, action_log_prob = agent.select_action(state)
-        state_, reward, done, die = env.step(action * np.array([2., 1., 1.]) + np.array([-1., 0., 0.]))
-        if args.render:
-            env.render()
-        if agent.store((state, action, action_log_prob, reward, state_)):
-            print('updating')
-            agent.update()
-        score += reward
-        state = state_
-        if done or die:
+        for t in range(1000):
+            action, a_logp = agent.select_action(state)
+            state_, reward, done, die = env.step(action * np.array([2., 1., 1.]) + np.array([-1., 0., 0.]))
+            if args.render:
+                env.render()
+            if agent.store((state, action, a_logp, reward, state_)):
+                print('updating')
+                agent.update()
+            score += reward
+            state = state_
+            if done or die:
+                break
+        running_score = running_score * 0.99 + score * 0.01
+
+        if i_ep % args.log_interval == 0:
+            if args.vis:
+                draw_reward(xdata=i_ep, ydata=running_score)
+            print('Ep {}\tLast score: {:.2f}\tMoving average score: {:.2f}'.format(i_ep, score, running_score))
+            agent.save_param()
+        if running_score > env.reward_threshold:
+            print("Solved! Running reward is now {} and the last episode runs to {}!".format(running_score, score))
             break
-    running_score = running_score * 0.99 + score * 0.01
-
-    if i_ep % args.log_interval == 0:
-        draw_reward(xdata=i_ep, ydata=running_score)
-        print('Ep {}\tLast score: {:.2f}\tMoving average score: {:.2f}'.format(i_ep, score, running_score))
-        agent.save_param()
-    if running_score > env.reward_threshold:
-        print("Solved! Running reward is now {} and the last episode runs to {}!".format(running_score, score))
-        break
